@@ -80,39 +80,44 @@ class Web(object):
                 try:
                     with tempfile.NamedTemporaryFile(dir=options.tg_media_dir, suffix='.blob') as temp:
                         filename = temp.name
-                    self.proc.download_media(media, filename)
+                    contenet = await self.proc.download_media(media)
+                    with open(filename, "wb") as f:
+                        f.write(content)
                     self.id2media[id] = (media, filename)
                 except asyncio.TimeoutError:
                     return aiohttp.web.Response(status=504, text='I used to live in 504A')
                 except TelegramCliFail as ex:
                     return aiohttp.web.Response(status=404, text=ex.args[0])
-            with open(filename, 'rb') as f:
-                mime = None
-                if sys.platform == 'linux':
-                    try:
-                        mime = subprocess.check_output(['xdg-mime', 'query', 'filetype', filename],
-                                                       stdin=subprocess.DEVNULL).decode().strip()
-                    except:
-                        pass
-                if mime is None:
-                    mime = magic.from_file(filename, mime=True)
-                return aiohttp.web.Response(body=f.read(), headers={'Content-Type': mime})
+            else:
+                with open(filename, 'rb') as f:
+                    content = f.read()
+            mime = None
+            if sys.platform == 'linux':
+                try:
+                    mime = subprocess.check_output(['xdg-mime', 'query', 'filetype', filename],
+                                                    stdin=subprocess.DEVNULL).decode().strip()
+                except:
+                    pass
+            if mime is None:
+                mime = magic.from_file(filename, mime=True)
+            
+            return aiohttp.web.Response(body=content, headers={'Content-Type': mime})
         except Exception as ex:
             return aiohttp.web.Response(status=500, text=str(ex))
 
     async def handle_document(self, request):
         return await self.handle_media('document', request)
 
-    def run_telethon(self):
+    async def run_telethon(self):
         if self.proc:
-            self.proc.disconnect()
+            await self.proc.disconnect()
         self.proc = TelegramClient(options.tg_session, options.tg_api_id, options.tg_api_hash)
         try:
-            self.proc.connect()
+            await self.proc.connect()
         except:
             error('Failed to connect to Telegram server')
             sys.exit(2)
-        self.authorized = self.proc.is_user_authorized()
+        self.authorized = await self.proc.is_user_authorized()
         if not self.authorized and not options.tg_phone:
             error('Not authorized. Please set --tg-phone')
             sys.exit(2)
@@ -122,24 +127,28 @@ class Web(object):
         traceback.print_stack()
         if self.proc:
             try:
-                self.proc.disconnect()
+                await self.proc.disconnect()
                 time.sleep(1)
             except:
                 pass
         os.execl(sys.executable, sys.executable, *sys.argv)
 
-    def start(self, listens, port, loop):
+    async def start(self, listens, port, loop):
         self.loop = loop
         self.app = aiohttp.web.Application()
+        self.runner = aiohttp.web.AppRunner(app)
+        await self.runner.setup()
         self.app.router.add_route('GET', '/document/{id}', self.handle_document)
-        self.handler = self.app.make_handler()
+        # self.handler = self.app.make_handler()
         self.srv = []
         for i in listens:
             self.srv.append(loop.run_until_complete(
-                loop.create_server(self.handler, i, port, ssl=self.tls)))
-        self.run_telethon()
+                aiohttp.web.TCPSite(runner, i, port))
+            # self.srv.append(loop.run_until_complete(
+            #     loop.create_server(self.handler, i, port, ssl=self.tls)))
+        await self.run_telethon()
         if self.authorized:
-            self.init()
+            await self.init()
 
         #async def poll():
         #    while 1:
@@ -151,6 +160,7 @@ class Web(object):
         #    self.poll = loop.create_task(poll())
 
     def stop(self):
+        # TODO
         self.proc.disconnect()
         for i in self.srv:
             i.close()
@@ -173,31 +183,34 @@ class Web(object):
         self.id2message[record['id']] = record
 
     # TODO admin channel.update_admins(members)
-    def channel_get_participants(self, channel):
+    async def channel_get_participants(self, channel):
         tg_users = []
         offset = 0
-        while True:
-            participants = self.proc(tl.functions.channels.GetParticipantsRequest(
-                channel.tg_room,
-                tl.types.ChannelParticipantsSearch(''),
-                offset,
-                100,
-                0,  # hash
-            ))
-            if not participants.users: break
-            tg_users.extend(participants.users)
-            offset += len(participants.users)
+        # TODO: set a proper limit to avoid trigger FloodLimit
+        async for participant in self.proc.get_participants(channel.tg_room):
+            tg_users.append(participant)
+        # while True:
+        #     participants = await self.proc(tl.functions.channels.GetParticipantsRequest(
+        #         channel.tg_room,
+        #         tl.types.ChannelParticipantsSearch(''),
+        #         offset,
+        #         100,
+        #         0,  # hash
+        #     ))
+        #     if not participants.users: break
+        #     tg_users.extend(participants.users)
+        #     offset += len(participants.users)
         channel.update_members(tg_users)
 
-    def channel_invite(self, client, channel, user):
+    async def channel_invite(self, client, channel, user):
         try:
             if channel.is_type(tl.types.PeerChannel):
-                self.proc(tl.functions.channels.InviteToChannelRequest(
+                await self.proc(tl.functions.channels.InviteToChannelRequest(
                     channel.peer.channel_id,
                     [self.proc.get_input_entity(user.user_id)]
                 ))
             elif channel.is_type(tl.types.PeerChat):
-                self.proc(tl.functions.messages.AddChatUserRequest(
+                await self.proc(tl.functions.messages.AddChatUserRequest(
                     channel.peer.chat_id,
                     self.proc.get_input_entity(user.user_id),
                     0,
@@ -226,12 +239,12 @@ class Web(object):
         else:
             client.err_chanoprivsneeded(channel.name)
 
-    def channel_kick(self, client, channel, user):
+    async def channel_kick(self, client, channel, user):
         try:
             if channel.is_type(tl.types.PeerChannel):
                 pass
             elif channel.is_type(tl.types.PeerChat):
-                self.proc(tl.functions.messages.DeleteChatUserRequest(
+                await self.proc(tl.functions.messages.DeleteChatUserRequest(
                     channel.peer.chat_id,
                     self.proc.get_input_entity(user.user_id),
                 ))
@@ -240,24 +253,24 @@ class Web(object):
         except telethon.errors.rpcbaseerrors.RPCError:
             pass
 
-    def chat_get_full(self, channel):
-        chatfull = self.proc(tl.functions.messages.GetFullChatRequest(
+    async def chat_get_full(self, channel):
+        chatfull = await self.proc(tl.functions.messages.GetFullChatRequest(
             channel.tg_room.id
         ))
         channel.update_members(chatfull.users)
 
-    def contact_list(self):
-        contacts = self.proc(tl.functions.contacts.GetContactsRequest(0))
+    async def contact_list(self):
+        contacts = await self.proc(tl.functions.contacts.GetContactsRequest(0))
         for tg_user in contacts.users:
             server.ensure_special_user(tg_user.id, tg_user)
 
-    def channel_list(self):
+    async def channel_list(self):
         # https://github.com/LonamiWebs/Telethon/wiki/Retrieving-all-dialogs
         last_date = None
         chunk_size = 20
-        while True:
+        while True:x    
             debug('channel_list %r', last_date)
-            r = self.proc(tl.functions.messages.GetDialogsRequest(
+            r = await self.proc(tl.functions.messages.GetDialogsRequest(
                 offset_date=last_date,
                 offset_id=0,
                 offset_peer=tl.types.InputPeerEmpty(),
@@ -276,55 +289,57 @@ class Web(object):
             last_date = date
             time.sleep(0.7)
 
-    def channel_message_get(self, channel, id):
-        messages = self.proc(tl.functions.channels.GetMessagesRequest(
+    async def channel_message_get(self, channel, id):
+        messages = await self.proc(tl.functions.channels.GetMessagesRequest(
             self.proc.get_input_entity(channel.peer), [id])).messages
         return messages[0] if messages else None
 
-    def message_get(self, id):
-        messages = self.proc(tl.functions.messages.GetMessagesRequest([id])).messages
+    async def message_get(self, id):
+        messages = await self.proc(tl.functions.messages.GetMessagesRequest([id])).messages
         return messages[0] if messages else None
 
-    def get_self(self):
-        data = self.proc.get_me()
+    async def get_self(self):
+        data = await self.proc.get_me()
         server.user_id = data.id
 
-    def init(self):
+    async def init(self):
         try:
-            web.get_self()
-            web.channel_list()
-            web.contact_list()
+            await web.get_self()
+            await web.channel_list()
+            await web.contact_list()
         except Exception as ex:
             traceback.print_exc()
 
-    def mark_read(self, peer, max_id):
-        self.proc.send_read_acknowledge(peer, max_id=max_id)
+    async def mark_read(self, peer, max_id):
+        await self.proc.send_read_acknowledge(peer, max_id=max_id)
 
-    def channel_members(self, channel):
+    async def channel_members(self, channel):
         try:
             if channel.is_type(tl.types.PeerChannel):
-                self.channel_get_participants(channel)
+                await self.channel_get_participants(channel)
             elif channel.is_type(tl.types.PeerChat):
-                self.chat_get_full(channel)
+                await self.chat_get_full(channel)
         except Exception as ex:
             error('channel_members %r', channel)
             traceback.print_exc()
 
-    def send_file(self, client, peer, filename, body):
+    async def send_file(self, client, peer, filename, body):
         with tempfile.TemporaryDirectory() as directory:
             filename = os.path.join(directory, filename)
             try:
                 with open(filename, 'wb') as f:
                     f.write(body)
                     f.flush()
-                self.proc.send_file(peer, f.name)
+                # TODO: send_file should have provided a filename parameter so
+                # that we would not need to create a temp file
+                async self.proc.send_file(peer, f.name)
             except telethon.errors.rpcbaseerrors.RPCError:
                 client.err_cannotsendtochan(peer.nick, 'Cannot send the file')
             os.unlink(filename)
 
-    def msg(self, client, to, text, reply_to=None):
+    async def msg(self, client, to, text, reply_to=None):
         try:
-            msg = self.proc.send_message(to.peer, text, reply_to=reply_to)
+            msg = await self.proc.send_message(to.peer, text, reply_to=reply_to)
             irc_log(to, to, msg.date, client, msg.message)
         except telethon.errors.rpcbaseerrors.RPCError:
             traceback.print_exc()
@@ -1258,7 +1273,7 @@ class SpecialChannel(Channel):
             if user in self.members:
                 client.err_useronchannel(nick, self.name)
             else:
-                web.channel_invite(client, self, user)
+                asyncio.create_task(web.channel_invite(client, self, user))
         else:
             client.err_nosuchnick(nick)
 
@@ -1281,7 +1296,7 @@ class SpecialChannel(Channel):
     def on_kick(self, client, nick, reason):
         if server.has_special_user(nick):
             user = server.get_special_user(nick)
-            web.channel_kick(client, self, user)
+            asyncio.create_task(web.channel_kick(client, self, user))
         else:
             client.err_usernotinchannel(nick, self.name)
 
@@ -1902,7 +1917,7 @@ class Server:
     def auth_clients(self):
         return (client for client in self.clients if client.registered)
 
-    def preferred_client(self):
+    def preferred_clientdef event(self):
         n = len(self.clients)
         opt, optv = None, n+2
         for c in self.clients:
@@ -2289,8 +2304,8 @@ def main():
     #loop.set_exception_handler(exception_handler)
 
     server.start(loop, irc_tls)
-    web.start(options.http_listen if options.http_listen else options.listen,
-              options.http_port, loop)
+    loop.run_until_complete(web.start(options.http_listen if options.http_listen else options.listen,
+              options.http_port, loop))
 
     for signame in ('SIGINT', 'SIGTERM'):
         loop.add_signal_handler(getattr(signal, signame), loop.stop)
